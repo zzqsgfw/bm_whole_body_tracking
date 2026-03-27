@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -81,5 +83,25 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
     if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
         agent_cfg.wandb_project = args_cli.log_project_name
         agent_cfg.neptune_project = args_cli.log_project_name
+    elif agent_cfg.logger in {"wandb", "neptune"} and os.environ.get("WANDB_PROJECT"):
+        agent_cfg.wandb_project = os.environ["WANDB_PROJECT"]
+        agent_cfg.neptune_project = os.environ["WANDB_PROJECT"]
 
-    return agent_cfg
+    if agent_cfg.logger == "wandb":
+        if not os.environ.get("WANDB_USERNAME") and os.environ.get("WANDB_ENTITY"):
+            os.environ["WANDB_USERNAME"] = os.environ["WANDB_ENTITY"]
+
+    from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
+
+    installed_version = None
+    for package_name in ("rsl-rl-lib", "rsl-rl"):
+        try:
+            installed_version = version(package_name)
+            break
+        except PackageNotFoundError:
+            continue
+
+    if installed_version is None:
+        raise RuntimeError("Unable to determine the installed rsl-rl version.")
+
+    return handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)

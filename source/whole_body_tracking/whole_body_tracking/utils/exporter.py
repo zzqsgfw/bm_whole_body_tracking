@@ -16,7 +16,7 @@ from whole_body_tracking.tasks.tracking.mdp import MotionCommand
 
 def export_motion_policy_as_onnx(
     env: ManagerBasedRLEnv,
-    actor_critic: object,
+    policy: object,
     path: str,
     normalizer: object | None = None,
     filename="policy.onnx",
@@ -24,13 +24,19 @@ def export_motion_policy_as_onnx(
 ):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-    policy_exporter = _OnnxMotionPolicyExporter(env, actor_critic, normalizer, verbose)
+    policy_exporter = _OnnxMotionPolicyExporter(env, policy, normalizer, verbose)
     policy_exporter.export(path, filename)
 
 
-class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
-    def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False):
-        super().__init__(actor_critic, normalizer, verbose)
+class _OnnxMotionPolicyExporter(torch.nn.Module):
+    def __init__(self, env: ManagerBasedRLEnv, policy, normalizer=None, verbose=False):
+        super().__init__()
+        self.verbose = verbose
+        if hasattr(policy, "as_onnx"):
+            self.policy_exporter = policy.as_onnx(verbose=verbose)
+        else:
+            self.policy_exporter = _OnnxPolicyExporter(policy, normalizer, verbose)
+
         cmd: MotionCommand = env.command_manager.get_term("motion")
 
         self.joint_pos = cmd.motion.joint_pos.to("cpu")
@@ -40,11 +46,14 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
         self.body_lin_vel_w = cmd.motion.body_lin_vel_w.to("cpu")
         self.body_ang_vel_w = cmd.motion.body_ang_vel_w.to("cpu")
         self.time_step_total = self.joint_pos.shape[0]
+        self.input_size = getattr(self.policy_exporter, "input_size", None)
+        if self.input_size is None:
+            self.input_size = self.policy_exporter.actor[0].in_features
 
     def forward(self, x, time_step):
         time_step_clamped = torch.clamp(time_step.long().squeeze(-1), max=self.time_step_total - 1)
         return (
-            self.actor(self.normalizer(x)),
+            self.policy_exporter(x),
             self.joint_pos[time_step_clamped],
             self.joint_vel[time_step_clamped],
             self.body_pos_w[time_step_clamped],
@@ -55,7 +64,8 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
 
     def export(self, path, filename):
         self.to("cpu")
-        obs = torch.zeros(1, self.actor[0].in_features)
+        self.eval()
+        obs = torch.zeros(1, self.input_size)
         time_step = torch.zeros(1, 1)
         torch.onnx.export(
             self,

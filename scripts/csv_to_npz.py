@@ -30,6 +30,18 @@ parser.add_argument(
 )
 parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
+parser.add_argument(
+    "--output_file",
+    type=str,
+    default=None,
+    help="Optional path to save the converted motion npz locally. Defaults to /tmp/{output_name}.npz.",
+)
+parser.add_argument(
+    "--upload_wandb",
+    action="store_true",
+    default=False,
+    help="Upload the converted motion to WandB registry after saving locally.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -298,17 +310,23 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
             ):
                 log[k] = np.stack(log[k], axis=0)
 
-            np.savez("/tmp/motion.npz", **log)
+            output_file = args_cli.output_file or f"/tmp/{args_cli.output_name}.npz"
+            np.savez(output_file, **log)
+            print(f"[INFO]: Motion saved locally to: {output_file}")
 
-            import wandb
+            if args_cli.upload_wandb:
+                import wandb
 
-            COLLECTION = args_cli.output_name
-            run = wandb.init(project="csv_to_npz", name=COLLECTION)
-            print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
-            REGISTRY = "motions"
-            logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
-            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
-            print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+                collection = args_cli.output_name
+                run = wandb.init(project="csv_to_npz", name=collection)
+                print(f"[INFO]: Logging motion to wandb: {collection}")
+                registry = "motions"
+                logged_artifact = run.log_artifact(artifact_or_path=output_file, name=collection, type=registry)
+                run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{registry}/{collection}")
+                print(f"[INFO]: Motion saved to wandb registry: {registry}/{collection}")
+
+            print("[INFO]: Conversion finished, closing simulator.")
+            break
 
 
 def main():

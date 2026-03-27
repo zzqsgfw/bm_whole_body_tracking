@@ -14,8 +14,13 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 INSTALL_REQUIRES = [
     "psutil",
     "onnxscript",
-    "wandb>=0.19",
 ]
+
+EXTRAS_REQUIRE = {
+    "wandb": [
+        "wandb>=0.19",
+    ],
+}
 
 # Installation operation
 setup(
@@ -28,6 +33,7 @@ setup(
     description=EXTENSION_TOML_DATA["package"]["description"],
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
     install_requires=INSTALL_REQUIRES,
+    extras_require=EXTRAS_REQUIRE,
     license="MIT",
     include_package_data=True,
     python_requires=">=3.10",

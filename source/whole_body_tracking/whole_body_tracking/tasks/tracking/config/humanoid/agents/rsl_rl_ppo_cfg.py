@@ -9,6 +9,7 @@ class HumanoidFlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 50
     experiment_name = "humanoid_flat"
     empirical_normalization = False
+    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[512, 256, 128],

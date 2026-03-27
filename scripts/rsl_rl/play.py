@@ -110,6 +110,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
+    if args_cli.motion_file is not None:
+        print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
+        env_cfg.commands.motion.motion_file = args_cli.motion_file
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -146,8 +150,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     export_motion_policy_as_onnx(
         env.unwrapped,
-        ppo_runner.alg.policy,
-        normalizer=ppo_runner.obs_normalizer,
+        ppo_runner.alg.get_policy(),
         path=export_model_dir,
         filename="policy.onnx",
     )
