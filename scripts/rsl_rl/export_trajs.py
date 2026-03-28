@@ -1,17 +1,29 @@
-"""Roll out an RSL-RL checkpoint and export G1 full-body trajectories as .pt.
+"""DART-style rollout: inject per-env action noise for BC generalisation.
 
-The exported schema matches the g1_fullbody motion-generation dataset:
-    - command
-    - motion_anchor_pos_b
-    - motion_anchor_ori_b
-    - base_lin_vel
-    - base_ang_vel
-    - joint_pos
-    - joint_vel
-    - last_action
-    - expert_action
+Env 0 is ALWAYS noise-free (the "clean" reference trajectory).
+Envs 1..N-1 each get i.i.d. Gaussian noise on top of the policy output.
+The *noisy* action is what gets executed AND recorded as ``expert_action``,
+while the raw policy output is saved separately as ``policy_action`` so the
+student can optionally regress to either target.
 
-Each saved file contains a list[dict], where each dict is one trajectory.
+Trajectory list layout (deterministic):
+    trajectories[0]           -> env-0, noise_std = 0  (clean)
+    trajectories[1..N-1]      -> env-1..N-1, noise_std > 0
+
+Schema per trajectory dict (g1_fullbody_v2_dart):
+    command              (T, 15)
+    motion_anchor_pos_b  (T, 3)
+    motion_anchor_ori_b  (T, 6)
+    body_pos_b           (T, 42)   # 14 bodies * 3 (Cartesian pos in anchor frame)
+    body_ori_b           (T, 84)   # 14 bodies * 6 (Rot6D in anchor frame)
+    base_lin_vel         (T, 3)
+    base_ang_vel         (T, 3)
+    joint_pos            (T, 29)
+    joint_vel            (T, 29)
+    last_action          (T, 29)
+    policy_action        (T, 29)   # raw policy output (no noise)
+    expert_action        (T, 29)   # = policy_action + noise  (executed)
+    metadata             dict
 """
 
 import argparse
@@ -24,17 +36,17 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 
-parser = argparse.ArgumentParser(description="Export rollout trajectories from an RSL-RL checkpoint.")
+parser = argparse.ArgumentParser(description="DART-style trajectory export from an RSL-RL checkpoint.")
 parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric.")
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
+parser.add_argument("--num_envs", type=int, default=4096, help="Number of parallel environments (env-0 is noise-free).")
 parser.add_argument("--task", type=str, default=None, help="Task name.")
 parser.add_argument("--motion_file", type=str, default=None, help="Override motion file.")
 parser.add_argument("--checkpoint_path", type=str, default=None, help="Absolute or relative path to checkpoint.")
 parser.add_argument("--save_dir", type=str, default=None, help="Directory to save exported .pt trajectories.")
 parser.add_argument("--save_name", type=str, default=None, help="Output .pt filename.")
-parser.add_argument("--num_trajectories", type=int, default=1, help="Number of trajectories to export.")
-parser.add_argument("--max_steps", type=int, default=None, help="Optional cap on rollout steps.")
-parser.add_argument("--save_partial", action="store_true", default=False, help="Also save unfinished trajectories.")
+parser.add_argument("--max_steps", type=int, default=None, help="Optional cap on rollout steps (default: full motion length).")
+parser.add_argument("--noise_std", type=float, default=0.05, help="Action-space Gaussian noise std for envs 1..N-1.")
+parser.add_argument("--action_clip", type=float, default=1.0, help="Clip noisy actions to [-clip, clip].")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -64,6 +76,25 @@ import whole_body_tracking.tasks.tracking.mdp as tracking_mdp
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SAVE_DIR = REPO_ROOT / "logs" / "trajs"
 
+FRAME_KEYS = [
+    "command",
+    "motion_anchor_pos_b",
+    "motion_anchor_ori_b",
+    "body_pos_b",
+    "body_ori_b",
+    "base_lin_vel",
+    "base_ang_vel",
+    "joint_pos",
+    "joint_vel",
+    "last_action",
+    "policy_action",
+    "expert_action",
+]
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
 def _load_motion_file_from_run_dir(run_dir: Path) -> str | None:
     env_yaml = run_dir / "params" / "env.yaml"
@@ -71,7 +102,6 @@ def _load_motion_file_from_run_dir(run_dir: Path) -> str | None:
         return None
     with env_yaml.open("r", encoding="utf-8") as f:
         data = yaml.unsafe_load(f)
-
     motion_file = (
         data.get("commands", {})
         .get("motion", {})
@@ -91,70 +121,97 @@ def _resolve_resume_path(agent_cfg: RslRlOnPolicyRunnerCfg) -> tuple[str, Path]:
         if not resume_path.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
         return str(resume_path), resume_path.parent
-
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
     return resume_path, Path(os.path.dirname(resume_path))
 
 
-def _collect_clean_frame(raw_env, expert_action: torch.Tensor) -> dict[str, torch.Tensor]:
-    return {
-        "command": isaac_mdp.generated_commands(raw_env, "motion").detach().cpu(),
-        "motion_anchor_pos_b": tracking_mdp.motion_anchor_pos_b(raw_env, "motion").detach().cpu(),
-        "motion_anchor_ori_b": tracking_mdp.motion_anchor_ori_b(raw_env, "motion").detach().cpu(),
-        "base_lin_vel": isaac_mdp.base_lin_vel(raw_env).detach().cpu(),
-        "base_ang_vel": isaac_mdp.base_ang_vel(raw_env).detach().cpu(),
-        "joint_pos": isaac_mdp.joint_pos_rel(raw_env).detach().cpu(),
-        "joint_vel": isaac_mdp.joint_vel_rel(raw_env).detach().cpu(),
-        "last_action": isaac_mdp.last_action(raw_env).detach().cpu(),
-        "expert_action": expert_action.detach().cpu(),
-    }
+def _build_noise_mask(num_envs: int, noise_std: float, device: torch.device) -> torch.Tensor:
+    """Per-env noise scale: env-0 = 0, envs 1..N-1 = noise_std."""
+    mask = torch.full((num_envs, 1), noise_std, device=device)
+    mask[0] = 0.0
+    return mask
 
 
-def _new_buffer() -> dict[str, list[torch.Tensor]]:
-    return {
-        "command": [],
-        "motion_anchor_pos_b": [],
-        "motion_anchor_ori_b": [],
-        "base_lin_vel": [],
-        "base_ang_vel": [],
-        "joint_pos": [],
-        "joint_vel": [],
-        "last_action": [],
-        "expert_action": [],
-    }
+def _inject_noise(
+    policy_action: torch.Tensor,
+    noise_mask: torch.Tensor,
+    clip: float,
+) -> torch.Tensor:
+    noise = torch.randn_like(policy_action) * noise_mask
+    return (policy_action + noise).clamp(-clip, clip)
 
 
-def _finalize_trajectory(
-    buffers: list[dict[str, list[torch.Tensor]]],
-    env_id: int,
-    save_name: str,
-    traj_index: int,
-    checkpoint_path: str,
-    motion_file: str | None,
-    terminated: bool,
-    wrapped: bool,
-):
-    if len(buffers[env_id]["expert_action"]) == 0:
-        return None
+def _probe_frame_dims(raw_env) -> dict[str, int]:
+    """Probe observation dims once."""
+    with torch.inference_mode():
+        return {
+            "command": isaac_mdp.generated_commands(raw_env, "motion").shape[-1],
+            "motion_anchor_pos_b": tracking_mdp.motion_anchor_pos_b(raw_env, "motion").shape[-1],
+            "motion_anchor_ori_b": tracking_mdp.motion_anchor_ori_b(raw_env, "motion").shape[-1],
+            "body_pos_b": tracking_mdp.robot_body_pos_b(raw_env, "motion").shape[-1],
+            "body_ori_b": tracking_mdp.robot_body_ori_b(raw_env, "motion").shape[-1],
+            "base_lin_vel": isaac_mdp.base_lin_vel(raw_env).shape[-1],
+            "base_ang_vel": isaac_mdp.base_ang_vel(raw_env).shape[-1],
+            "joint_pos": isaac_mdp.joint_pos_rel(raw_env).shape[-1],
+            "joint_vel": isaac_mdp.joint_vel_rel(raw_env).shape[-1],
+            "last_action": isaac_mdp.last_action(raw_env).shape[-1],
+        }
 
-    traj = {key: torch.stack(value, dim=0) for key, value in buffers[env_id].items()}
-    traj["metadata"] = {
-        "total_frames": traj["expert_action"].shape[0],
-        "recording_name": save_name,
-        "trajectory_id": f"{save_name}_traj{traj_index:04d}_env{env_id}",
-        "schema": "g1_fullbody_v1",
-        "condition_dim": 160,
-        "action_dim": 29,
-        "env_id": env_id,
-        "source_checkpoint": checkpoint_path,
-        "motion_file": motion_file,
-        "terminated": terminated,
-        "wrapped_motion": wrapped,
-    }
-    buffers[env_id] = _new_buffer()
-    return traj
 
+def _alloc_chunk(chunk_size: int, num_envs: int, frame_dims: dict[str, int], action_dim: int,
+                 device: torch.device) -> dict[str, torch.Tensor]:
+    """Allocate a GPU chunk buffer (chunk_size, num_envs, dim)."""
+    buf = {}
+    for key, dim in frame_dims.items():
+        buf[key] = torch.empty(chunk_size, num_envs, dim, device=device)
+    buf["policy_action"] = torch.empty(chunk_size, num_envs, action_dim, device=device)
+    buf["expert_action"] = torch.empty(chunk_size, num_envs, action_dim, device=device)
+    return buf
+
+
+def _write_frame(buf: dict[str, torch.Tensor], idx: int, raw_env,
+                 policy_action: torch.Tensor, expert_action: torch.Tensor):
+    """Write one step into GPU chunk at position idx."""
+    buf["command"][idx] = isaac_mdp.generated_commands(raw_env, "motion")
+    buf["motion_anchor_pos_b"][idx] = tracking_mdp.motion_anchor_pos_b(raw_env, "motion")
+    buf["motion_anchor_ori_b"][idx] = tracking_mdp.motion_anchor_ori_b(raw_env, "motion")
+    buf["body_pos_b"][idx] = tracking_mdp.robot_body_pos_b(raw_env, "motion")
+    buf["body_ori_b"][idx] = tracking_mdp.robot_body_ori_b(raw_env, "motion")
+    buf["base_lin_vel"][idx] = isaac_mdp.base_lin_vel(raw_env)
+    buf["base_ang_vel"][idx] = isaac_mdp.base_ang_vel(raw_env)
+    buf["joint_pos"][idx] = isaac_mdp.joint_pos_rel(raw_env)
+    buf["joint_vel"][idx] = isaac_mdp.joint_vel_rel(raw_env)
+    buf["last_action"][idx] = isaac_mdp.last_action(raw_env)
+    buf["policy_action"][idx] = policy_action
+    buf["expert_action"][idx] = expert_action
+
+
+def _flush_chunk(gpu_chunk: dict[str, torch.Tensor], used: int,
+                 cpu_store: dict[str, list[torch.Tensor]]):
+    """Async-copy filled portion of GPU chunk to CPU pinned memory."""
+    for key, tensor in gpu_chunk.items():
+        cpu_store[key].append(tensor[:used].to("cpu", non_blocking=True))
+    torch.cuda.synchronize()
+
+
+def _vram_usage_ratio(device: torch.device) -> tuple[float, int, int]:
+    """Return (used/total ratio, used_mb, total_mb) for the given CUDA device."""
+    idx = device.index if device.index is not None else 0
+    used = torch.cuda.memory_allocated(idx)
+    total = torch.cuda.get_device_properties(idx).total_memory
+    return used / total, used >> 20, total >> 20
+
+
+def _vram_is_dangerous(device: torch.device, threshold: float = 0.85) -> bool:
+    """True if VRAM usage exceeds threshold (default 85%)."""
+    ratio, _, _ = _vram_usage_ratio(device)
+    return ratio > threshold
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
@@ -186,85 +243,164 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     default_max_steps = int(motion_cmd.motion.time_step_total)
     max_steps = args_cli.max_steps if args_cli.max_steps is not None else default_max_steps
 
+    noise_std = args_cli.noise_std
+    action_clip = args_cli.action_clip
+
     save_dir = Path(args_cli.save_dir).expanduser() if args_cli.save_dir else DEFAULT_SAVE_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_stem = Path(resume_path).stem
     run_name = run_dir.name
-    save_name = args_cli.save_name or f"{run_name}__{checkpoint_stem}.pt"
+    save_name = args_cli.save_name or f"{run_name}__{checkpoint_stem}__dart.pt"
     if not save_name.endswith(".pt"):
         save_name += ".pt"
     output_path = save_dir / save_name
 
+    task_name = args_cli.task
+    noise_mask = _build_noise_mask(args_cli.num_envs, noise_std, env.unwrapped.device)
+
     print_dict(
         {
             "num_envs": args_cli.num_envs,
-            "num_trajectories": args_cli.num_trajectories,
             "max_steps": max_steps,
+            "noise_std": noise_std,
+            "action_clip": action_clip,
+            "task": task_name,
             "output_path": str(output_path),
             "motion_file": env_cfg.commands.motion.motion_file,
+            "mode": "full_trajectory (no early termination)",
         },
         nesting=4,
     )
 
-    obs, _ = env.get_observations()
-    buffers = [_new_buffer() for _ in range(args_cli.num_envs)]
-    trajectories = []
+    # -----------------------------------------------------------------------
+    # Chunked GPU rollout with dynamic VRAM safety.
+    # - Normal: flush every CHUNK_STEPS
+    # - If VRAM > 85%: emergency flush immediately
+    # - Chunk buffer is the ONLY large GPU allocation we control
+    # -----------------------------------------------------------------------
+    action_dim = 29
+    CHUNK_STEPS = 512
+    VRAM_DANGER_THRESHOLD = 0.85   # flush early if VRAM usage exceeds this
+    VRAM_CHECK_INTERVAL = 32       # check VRAM every N steps (not every step to avoid overhead)
+    frame_dims = _probe_frame_dims(raw_env)
+    device = env.unwrapped.device
+
+    ratio_init, used_init, total_init = _vram_usage_ratio(device)
+    print(f"[INFO] VRAM before chunk alloc: {used_init} MB / {total_init} MB ({ratio_init:.1%})")
+
+    gpu_chunk = _alloc_chunk(CHUNK_STEPS, args_cli.num_envs, frame_dims, action_dim, device)
+    cpu_store: dict[str, list[torch.Tensor]] = {k: [] for k in FRAME_KEYS}
+
+    chunk_mem_mb = sum(t.nelement() * t.element_size() for t in gpu_chunk.values()) / (1024 * 1024)
+    ratio_post, used_post, _ = _vram_usage_ratio(device)
+    print(f"[INFO] GPU chunk buffer: {chunk_mem_mb:.1f} MB "
+          f"({CHUNK_STEPS} steps x {args_cli.num_envs} envs)")
+    print(f"[INFO] VRAM after chunk alloc: {used_post} MB / {total_init} MB ({ratio_post:.1%})")
+    print(f"[INFO] VRAM safety threshold: {VRAM_DANGER_THRESHOLD:.0%}, check every {VRAM_CHECK_INTERVAL} steps")
+
+    obs = env.get_observations()
     steps = 0
+    chunk_idx = 0
+    emergency_flushes = 0
 
-    while simulation_app.is_running() and steps < max_steps and len(trajectories) < args_cli.num_trajectories:
+    while simulation_app.is_running() and steps < max_steps:
         with torch.inference_mode():
-            prev_time_steps = motion_cmd.time_steps.detach().clone()
-            actions = policy(obs)
-            frame = _collect_clean_frame(raw_env, actions)
+            policy_action = policy(obs)
+            expert_action = _inject_noise(policy_action, noise_mask, action_clip)
+            _write_frame(gpu_chunk, chunk_idx, raw_env, policy_action, expert_action)
+            obs, _, _, _ = env.step(expert_action)
 
-            for env_id in range(args_cli.num_envs):
-                for key, value in frame.items():
-                    buffers[env_id][key].append(value[env_id])
-
-            obs, _, dones, _ = env.step(actions)
-            next_time_steps = motion_cmd.time_steps.detach().clone()
-            wrapped = next_time_steps <= prev_time_steps
-            done_mask = dones.to(dtype=torch.bool).detach().cpu()
-            wrapped_mask = wrapped.detach().cpu()
-
-            for env_id in range(args_cli.num_envs):
-                if bool(done_mask[env_id]) or bool(wrapped_mask[env_id]):
-                    traj = _finalize_trajectory(
-                        buffers,
-                        env_id,
-                        output_path.stem,
-                        len(trajectories),
-                        resume_path,
-                        env_cfg.commands.motion.motion_file,
-                        terminated=bool(done_mask[env_id]),
-                        wrapped=bool(wrapped_mask[env_id]),
-                    )
-                    if traj is not None:
-                        trajectories.append(traj)
-                        if len(trajectories) >= args_cli.num_trajectories:
-                            break
         steps += 1
+        chunk_idx += 1
 
-    if args_cli.save_partial and len(trajectories) < args_cli.num_trajectories:
-        for env_id in range(args_cli.num_envs):
-            traj = _finalize_trajectory(
-                buffers,
-                env_id,
-                output_path.stem,
-                len(trajectories),
-                resume_path,
-                env_cfg.commands.motion.motion_file,
-                terminated=False,
-                wrapped=False,
-            )
-            if traj is not None:
-                trajectories.append(traj)
-            if len(trajectories) >= args_cli.num_trajectories:
-                break
+        # --- flush conditions ---
+        need_flush = False
 
+        # 1) chunk full
+        if chunk_idx >= CHUNK_STEPS:
+            need_flush = True
+
+        # 2) periodic VRAM safety check
+        elif steps % VRAM_CHECK_INTERVAL == 0 and chunk_idx > 0:
+            if _vram_is_dangerous(device, VRAM_DANGER_THRESHOLD):
+                ratio, used, total = _vram_usage_ratio(device)
+                print(f"  [WARN] step {steps}: VRAM {used}MB/{total}MB ({ratio:.1%}) > "
+                      f"{VRAM_DANGER_THRESHOLD:.0%}, emergency flush ({chunk_idx} frames)")
+                need_flush = True
+                emergency_flushes += 1
+
+        if need_flush:
+            _flush_chunk(gpu_chunk, chunk_idx, cpu_store)
+            chunk_idx = 0
+            if steps % 1000 < VRAM_CHECK_INTERVAL or emergency_flushes > 0:
+                ratio, used, _ = _vram_usage_ratio(device)
+                print(f"  step {steps}/{max_steps} (flushed, VRAM {used}MB {ratio:.1%})")
+
+    # flush remaining
+    if chunk_idx > 0:
+        _flush_chunk(gpu_chunk, chunk_idx, cpu_store)
+
+    del gpu_chunk
+    torch.cuda.empty_cache()
+
+    if emergency_flushes > 0:
+        print(f"[INFO] Emergency VRAM flushes during rollout: {emergency_flushes}")
+
+    print(f"\n[INFO] Rollout done ({steps} steps). Concatenating CPU buffers...")
+    # concat chunks: each key -> (T, N, D)
+    cpu_buf = {key: torch.cat(chunks, dim=0) for key, chunks in cpu_store.items()}
+    del cpu_store
+
+    print(f"[INFO] Building {args_cli.num_envs} trajectory dicts...")
+    # trajectories[0] = env-0 (clean), trajectories[1..] = noisy
+    trajectories = []
+    # env-0 first (clean)
+    traj_clean = {key: cpu_buf[key][:, 0, :] for key in FRAME_KEYS}
+    traj_clean["metadata"] = {
+        "total_frames": steps,
+        "recording_name": output_path.stem,
+        "trajectory_id": f"{output_path.stem}_traj0000_env0",
+        "schema": "g1_fullbody_v2_dart",
+        "condition_dim": 286,
+        "action_dim": action_dim,
+        "env_id": 0,
+        "noise_std": 0.0,
+        "is_clean": True,
+        "task": task_name,
+        "source_checkpoint": resume_path,
+        "source_run_dir": run_name,
+        "motion_file": env_cfg.commands.motion.motion_file,
+    }
+    trajectories.append(traj_clean)
+
+    for env_id in range(1, args_cli.num_envs):
+        traj = {key: cpu_buf[key][:, env_id, :] for key in FRAME_KEYS}
+        traj["metadata"] = {
+            "total_frames": steps,
+            "recording_name": output_path.stem,
+            "trajectory_id": f"{output_path.stem}_traj{env_id:04d}_env{env_id}",
+            "schema": "g1_fullbody_v2_dart",
+            "condition_dim": 286,
+            "action_dim": action_dim,
+            "env_id": env_id,
+            "noise_std": noise_std,
+            "is_clean": False,
+            "task": task_name,
+            "source_checkpoint": resume_path,
+            "source_run_dir": run_name,
+            "motion_file": env_cfg.commands.motion.motion_file,
+        }
+        trajectories.append(traj)
+    del cpu_buf
+
+    print(f"[INFO] Writing to disk: {output_path}")
     torch.save(trajectories, output_path)
-    print(f"[INFO] Saved {len(trajectories)} trajectories to: {output_path}")
+    total_frames = steps * args_cli.num_envs
+    file_size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"[INFO] Saved {len(trajectories)} trajectories ({total_frames} total frames, {file_size_mb:.1f} MB)")
+    print(f"  trajectories[0] is_clean=True")
+    print(f"  task={task_name}  checkpoint={checkpoint_stem}  run={run_name}")
     env.close()
 
 
