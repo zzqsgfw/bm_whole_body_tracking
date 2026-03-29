@@ -96,17 +96,20 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         if not os.environ.get("WANDB_USERNAME") and os.environ.get("WANDB_ENTITY"):
             os.environ["WANDB_USERNAME"] = os.environ["WANDB_ENTITY"]
 
-    from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
+    try:
+        from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
 
-    installed_version = None
-    for package_name in ("rsl-rl-lib", "rsl-rl"):
-        try:
-            installed_version = version(package_name)
-            break
-        except PackageNotFoundError:
-            continue
+        installed_version = None
+        for package_name in ("rsl-rl-lib", "rsl-rl"):
+            try:
+                installed_version = version(package_name)
+                break
+            except PackageNotFoundError:
+                continue
 
-    if installed_version is None:
-        raise RuntimeError("Unable to determine the installed rsl-rl version.")
+        if installed_version is not None:
+            return handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
+    except ImportError:
+        pass
 
-    return handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
+    return agent_cfg

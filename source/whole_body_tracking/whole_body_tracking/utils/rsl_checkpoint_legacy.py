@@ -52,7 +52,17 @@ def convert_legacy_rsl_checkpoint(loaded: dict) -> dict:
 def load_on_policy_runner_checkpoint(
     runner: "OnPolicyRunner", resume_path: str, device: str, *, weights_only: bool = False
 ) -> None:
-    """Load a checkpoint file into an :class:`rsl_rl.runners.OnPolicyRunner` (supports legacy saves)."""
+    """Load a checkpoint file into an :class:`rsl_rl.runners.OnPolicyRunner` (supports legacy saves).
+
+    Supports both rsl-rl v3 (``OnPolicyRunner.load``) and rsl-rl >= 4 (``PPO.load``).
+    """
+    # rsl-rl v3: PPO has no .load(); OnPolicyRunner.load(path) handles everything.
+    if not hasattr(runner.alg, "load"):
+        runner.load(resume_path, load_optimizer=False, map_location=device)
+        print(f"[INFO]: Loaded checkpoint via OnPolicyRunner.load (rsl-rl v3): {resume_path}")
+        return
+
+    # rsl-rl >= 4 path
     loaded = torch.load(resume_path, map_location=device, weights_only=weights_only)
     if is_legacy_rsl_checkpoint(loaded):
         convert_legacy_rsl_checkpoint(loaded)
