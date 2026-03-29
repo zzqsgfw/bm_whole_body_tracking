@@ -41,9 +41,7 @@ echo "PID: $$"
 echo "========================================="
 
 RUNS=(
-  "2026-03-27_18-55-16_dance1_subject1_personal_probe_5000iter_4096env_2026-03-27 model_4999.pt"
   "2026-03-27_21-08-22_walk1_subject1_personal_probe_3000iter_4096env_2026-03-27 model_2999.pt"
-  "2026-03-27_23-53-08_walk2_subject1_personal_probe_3000iter_4096env_2026-03-27 model_2999.pt"
 )
 
 OK=0; FAIL=0

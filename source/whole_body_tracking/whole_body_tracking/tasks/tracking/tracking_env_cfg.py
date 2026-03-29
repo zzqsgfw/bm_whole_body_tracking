@@ -87,15 +87,22 @@ class CommandsCfg:
         resampling_time_range=(1.0e9, 1.0e9),
         debug_vis=False,
         pose_range={
-            "x": (-0.05, 0.05),
-            "y": (-0.05, 0.05),
-            "z": (-0.01, 0.01),
-            "roll": (-0.1, 0.1),
-            "pitch": (-0.1, 0.1),
-            "yaw": (-0.2, 0.2),
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
         },
-        velocity_range=VELOCITY_RANGE,
-        joint_position_range=(-0.1, 0.1),
+        velocity_range={
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        },
+        joint_position_range=(0.0, 0.0),
     )
 
 
@@ -186,13 +193,13 @@ class EventCfg:
         },
     )
 
-    # interval
-    push_robot = EventTerm(
-        func=mdp.push_by_setting_velocity,
-        mode="interval",
-        interval_range_s=(1.0, 3.0),
-        params={"velocity_range": VELOCITY_RANGE},
-    )
+    # interval — push disabled for clean full-trajectory training
+    # push_robot = EventTerm(
+    #     func=mdp.push_by_setting_velocity,
+    #     mode="interval",
+    #     interval_range_s=(1.0, 3.0),
+    #     params={"velocity_range": VELOCITY_RANGE},
+    # )
 
 
 @configclass
@@ -254,7 +261,8 @@ class RewardsCfg:
 class TerminationsCfg:
     """Termination terms for the MDP."""
 
-    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    # time_out disabled: episode runs until motion ends or robot falls
+    # time_out = DoneTerm(func=mdp.time_out, time_out=True)
     anchor_pos = DoneTerm(
         func=mdp.bad_anchor_pos_z_only,
         params={"command_name": "motion", "threshold": 0.25},
@@ -310,7 +318,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
         """Post initialization."""
         # general settings
         self.decimation = 4
-        self.episode_length_s = 10.0
+        self.episode_length_s = 1e6  # effectively infinite — no time_out truncation
         # simulation settings
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation

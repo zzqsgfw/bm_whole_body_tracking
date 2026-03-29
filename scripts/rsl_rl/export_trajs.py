@@ -10,15 +10,17 @@ Trajectory list layout (deterministic):
     trajectories[0]           -> env-0, noise_std = 0  (clean)
     trajectories[1..N-1]      -> env-1..N-1, noise_std > 0
 
-Schema per trajectory dict (g1_fullbody_v2_dart):
+Schema per trajectory dict (g1_fullbody_v3_dart):
     command              (T, 15)
-    motion_anchor_pos_b  (T, 3)
-    motion_anchor_ori_b  (T, 6)
+    base_pos_w           (T, 3)    # world-frame root position (for MuJoCo viewer)
+    base_quat_w          (T, 4)    # world-frame root quaternion [w,x,y,z]
+    motion_anchor_pos_b  (T, 3)    # motion anchor relative to robot anchor (body frame)
+    motion_anchor_ori_b  (T, 6)    # motion anchor relative orientation (Rot6D)
     body_pos_b           (T, 42)   # 14 bodies * 3 (Cartesian pos in anchor frame)
     body_ori_b           (T, 84)   # 14 bodies * 6 (Rot6D in anchor frame)
     base_lin_vel         (T, 3)
     base_ang_vel         (T, 3)
-    joint_pos            (T, 29)
+    joint_pos            (T, 29)   # joint_pos_rel (relative to default)
     joint_vel            (T, 29)
     last_action          (T, 29)
     policy_action        (T, 29)   # raw policy output (no noise)
@@ -42,6 +44,7 @@ parser.add_argument("--num_envs", type=int, default=4096, help="Number of parall
 parser.add_argument("--task", type=str, default=None, help="Task name.")
 parser.add_argument("--motion_file", type=str, default=None, help="Override motion file.")
 parser.add_argument("--checkpoint_path", type=str, default=None, help="Absolute or relative path to checkpoint.")
+parser.add_argument("--checkpoint", type=str, default=None, help="Alias of --checkpoint_path for consistency with play.py.")
 parser.add_argument("--save_dir", type=str, default=None, help="Directory to save exported .pt trajectories.")
 parser.add_argument("--save_name", type=str, default=None, help="Output .pt filename.")
 parser.add_argument("--max_steps", type=int, default=None, help="Optional cap on rollout steps (default: full motion length).")
@@ -71,6 +74,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import whole_body_tracking.tasks  # noqa: F401
 import whole_body_tracking.tasks.tracking.mdp as tracking_mdp
+from whole_body_tracking.utils.rsl_checkpoint_legacy import load_on_policy_runner_checkpoint
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -78,6 +82,8 @@ DEFAULT_SAVE_DIR = REPO_ROOT / "logs" / "trajs"
 
 FRAME_KEYS = [
     "command",
+    "base_pos_w",
+    "base_quat_w",
     "motion_anchor_pos_b",
     "motion_anchor_ori_b",
     "body_pos_b",
@@ -115,9 +121,28 @@ def _load_motion_file_from_run_dir(run_dir: Path) -> str | None:
     return str((REPO_ROOT / motion_path).resolve())
 
 
+def _resolve_motion_file_path(motion_file: str) -> str:
+    """Resolve motion .npz path similarly to play.py."""
+    raw = motion_file.strip()
+    expanded = os.path.expanduser(raw)
+    for candidate in (expanded, os.path.abspath(expanded)):
+        if os.path.isfile(candidate):
+            return candidate
+    rel = raw.replace("\\", "/").lstrip("/")
+    for prefix in ("whole_body_tracking/", "./whole_body_tracking/"):
+        if rel.startswith(prefix):
+            rel = rel[len(prefix):]
+            break
+    cand = REPO_ROOT / rel
+    if cand.is_file():
+        return str(cand.resolve())
+    return raw
+
+
 def _resolve_resume_path(agent_cfg: RslRlOnPolicyRunnerCfg) -> tuple[str, Path]:
-    if args_cli.checkpoint_path is not None:
-        resume_path = Path(args_cli.checkpoint_path).expanduser().resolve()
+    checkpoint_arg = args_cli.checkpoint_path or args_cli.checkpoint
+    if checkpoint_arg is not None:
+        resume_path = Path(checkpoint_arg).expanduser().resolve()
         if not resume_path.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
         return str(resume_path), resume_path.parent
@@ -147,6 +172,8 @@ def _probe_frame_dims(raw_env) -> dict[str, int]:
     with torch.inference_mode():
         return {
             "command": isaac_mdp.generated_commands(raw_env, "motion").shape[-1],
+            "base_pos_w": isaac_mdp.root_pos_w(raw_env).shape[-1],
+            "base_quat_w": isaac_mdp.root_quat_w(raw_env).shape[-1],
             "motion_anchor_pos_b": tracking_mdp.motion_anchor_pos_b(raw_env, "motion").shape[-1],
             "motion_anchor_ori_b": tracking_mdp.motion_anchor_ori_b(raw_env, "motion").shape[-1],
             "body_pos_b": tracking_mdp.robot_body_pos_b(raw_env, "motion").shape[-1],
@@ -174,6 +201,8 @@ def _write_frame(buf: dict[str, torch.Tensor], idx: int, raw_env,
                  policy_action: torch.Tensor, expert_action: torch.Tensor):
     """Write one step into GPU chunk at position idx."""
     buf["command"][idx] = isaac_mdp.generated_commands(raw_env, "motion")
+    buf["base_pos_w"][idx] = isaac_mdp.root_pos_w(raw_env)
+    buf["base_quat_w"][idx] = isaac_mdp.root_quat_w(raw_env)
     buf["motion_anchor_pos_b"][idx] = tracking_mdp.motion_anchor_pos_b(raw_env, "motion")
     buf["motion_anchor_ori_b"][idx] = tracking_mdp.motion_anchor_ori_b(raw_env, "motion")
     buf["body_pos_b"][idx] = tracking_mdp.robot_body_pos_b(raw_env, "motion")
@@ -218,11 +247,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs
 
+    # Keep original episode_length (10s) — policy was trained with this horizon.
+    # Disable random pushes during export for cleaner trajectories.
+    env_cfg.events.push_robot = None
+
     resume_path, run_dir = _resolve_resume_path(agent_cfg)
     print(f"[INFO] Loading checkpoint: {resume_path}")
 
     if args_cli.motion_file is not None:
-        env_cfg.commands.motion.motion_file = args_cli.motion_file
+        resolved_motion = _resolve_motion_file_path(args_cli.motion_file)
+        print(f"[INFO] Using motion file from CLI: {resolved_motion}")
+        env_cfg.commands.motion.motion_file = resolved_motion
     else:
         inferred_motion = _load_motion_file_from_run_dir(run_dir)
         if inferred_motion is not None:
@@ -235,7 +270,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env)
 
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    load_on_policy_runner_checkpoint(ppo_runner, resume_path, agent_cfg.device)
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     raw_env = env.unwrapped
@@ -274,35 +309,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     )
 
     # -----------------------------------------------------------------------
-    # Chunked GPU rollout with dynamic VRAM safety.
-    # - Normal: flush every CHUNK_STEPS
-    # - If VRAM > 85%: emergency flush immediately
-    # - Chunk buffer is the ONLY large GPU allocation we control
+    # Chunked GPU rollout — all terminations disabled, all envs run max_steps.
+    # GPU chunk buffer flushed to CPU periodically for VRAM safety.
     # -----------------------------------------------------------------------
     action_dim = 29
+    num_envs = args_cli.num_envs
     CHUNK_STEPS = 512
-    VRAM_DANGER_THRESHOLD = 0.85   # flush early if VRAM usage exceeds this
-    VRAM_CHECK_INTERVAL = 32       # check VRAM every N steps (not every step to avoid overhead)
     frame_dims = _probe_frame_dims(raw_env)
     device = env.unwrapped.device
 
     ratio_init, used_init, total_init = _vram_usage_ratio(device)
-    print(f"[INFO] VRAM before chunk alloc: {used_init} MB / {total_init} MB ({ratio_init:.1%})")
+    print(f"[INFO] VRAM baseline: {used_init} MB / {total_init} MB ({ratio_init:.1%})")
 
-    gpu_chunk = _alloc_chunk(CHUNK_STEPS, args_cli.num_envs, frame_dims, action_dim, device)
+    gpu_chunk = _alloc_chunk(CHUNK_STEPS, num_envs, frame_dims, action_dim, device)
     cpu_store: dict[str, list[torch.Tensor]] = {k: [] for k in FRAME_KEYS}
 
     chunk_mem_mb = sum(t.nelement() * t.element_size() for t in gpu_chunk.values()) / (1024 * 1024)
-    ratio_post, used_post, _ = _vram_usage_ratio(device)
-    print(f"[INFO] GPU chunk buffer: {chunk_mem_mb:.1f} MB "
-          f"({CHUNK_STEPS} steps x {args_cli.num_envs} envs)")
-    print(f"[INFO] VRAM after chunk alloc: {used_post} MB / {total_init} MB ({ratio_post:.1%})")
-    print(f"[INFO] VRAM safety threshold: {VRAM_DANGER_THRESHOLD:.0%}, check every {VRAM_CHECK_INTERVAL} steps")
+    print(f"[INFO] GPU chunk: {chunk_mem_mb:.1f} MB ({CHUNK_STEPS} steps x {num_envs} envs)")
+    print(f"[INFO] Terminations DISABLED, episode_length=1e6, push_robot OFF")
+    print(f"[INFO] Rollout: {num_envs} envs x {max_steps} steps")
 
     obs = env.get_observations()
     steps = 0
     chunk_idx = 0
-    emergency_flushes = 0
 
     while simulation_app.is_running() and steps < max_steps:
         with torch.inference_mode():
@@ -314,78 +343,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         steps += 1
         chunk_idx += 1
 
-        # --- flush conditions ---
-        need_flush = False
-
-        # 1) chunk full
         if chunk_idx >= CHUNK_STEPS:
-            need_flush = True
-
-        # 2) periodic VRAM safety check
-        elif steps % VRAM_CHECK_INTERVAL == 0 and chunk_idx > 0:
-            if _vram_is_dangerous(device, VRAM_DANGER_THRESHOLD):
-                ratio, used, total = _vram_usage_ratio(device)
-                print(f"  [WARN] step {steps}: VRAM {used}MB/{total}MB ({ratio:.1%}) > "
-                      f"{VRAM_DANGER_THRESHOLD:.0%}, emergency flush ({chunk_idx} frames)")
-                need_flush = True
-                emergency_flushes += 1
-
-        if need_flush:
             _flush_chunk(gpu_chunk, chunk_idx, cpu_store)
             chunk_idx = 0
-            if steps % 1000 < VRAM_CHECK_INTERVAL or emergency_flushes > 0:
+            if steps % 1000 < CHUNK_STEPS:
                 ratio, used, _ = _vram_usage_ratio(device)
-                print(f"  step {steps}/{max_steps} (flushed, VRAM {used}MB {ratio:.1%})")
+                print(f"  step {steps}/{max_steps} (VRAM {used}MB {ratio:.1%})")
 
-    # flush remaining
     if chunk_idx > 0:
         _flush_chunk(gpu_chunk, chunk_idx, cpu_store)
 
     del gpu_chunk
     torch.cuda.empty_cache()
 
-    if emergency_flushes > 0:
-        print(f"[INFO] Emergency VRAM flushes during rollout: {emergency_flushes}")
-
+    # -----------------------------------------------------------------------
+    # Bulk GPU->CPU concat, then slice per-env
+    # -----------------------------------------------------------------------
     print(f"\n[INFO] Rollout done ({steps} steps). Concatenating CPU buffers...")
-    # concat chunks: each key -> (T, N, D)
     cpu_buf = {key: torch.cat(chunks, dim=0) for key, chunks in cpu_store.items()}
     del cpu_store
 
-    print(f"[INFO] Building {args_cli.num_envs} trajectory dicts...")
-    # trajectories[0] = env-0 (clean), trajectories[1..] = noisy
+    print(f"[INFO] Building {num_envs} trajectory dicts...")
     trajectories = []
-    # env-0 first (clean)
-    traj_clean = {key: cpu_buf[key][:, 0, :] for key in FRAME_KEYS}
-    traj_clean["metadata"] = {
-        "total_frames": steps,
-        "recording_name": output_path.stem,
-        "trajectory_id": f"{output_path.stem}_traj0000_env0",
-        "schema": "g1_fullbody_v2_dart",
-        "condition_dim": 286,
-        "action_dim": action_dim,
-        "env_id": 0,
-        "noise_std": 0.0,
-        "is_clean": True,
-        "task": task_name,
-        "source_checkpoint": resume_path,
-        "source_run_dir": run_name,
-        "motion_file": env_cfg.commands.motion.motion_file,
-    }
-    trajectories.append(traj_clean)
-
-    for env_id in range(1, args_cli.num_envs):
+    # env-0 (clean) first
+    for env_id in range(num_envs):
         traj = {key: cpu_buf[key][:, env_id, :] for key in FRAME_KEYS}
+        env_noise = 0.0 if env_id == 0 else noise_std
         traj["metadata"] = {
             "total_frames": steps,
             "recording_name": output_path.stem,
             "trajectory_id": f"{output_path.stem}_traj{env_id:04d}_env{env_id}",
-            "schema": "g1_fullbody_v2_dart",
+            "schema": "g1_fullbody_v3_dart",
             "condition_dim": 286,
             "action_dim": action_dim,
             "env_id": env_id,
-            "noise_std": noise_std,
-            "is_clean": False,
+            "noise_std": env_noise,
+            "is_clean": env_id == 0,
             "task": task_name,
             "source_checkpoint": resume_path,
             "source_run_dir": run_name,
@@ -394,12 +387,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         trajectories.append(traj)
     del cpu_buf
 
-    print(f"[INFO] Writing to disk: {output_path}")
+    print(f"\n[INFO] Writing to disk: {output_path}")
     torch.save(trajectories, output_path)
-    total_frames = steps * args_cli.num_envs
+    total_frames = steps * num_envs
     file_size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"[INFO] Saved {len(trajectories)} trajectories ({total_frames} total frames, {file_size_mb:.1f} MB)")
-    print(f"  trajectories[0] is_clean=True")
+    print(f"  trajectories[0] is_clean=True, {steps} frames")
     print(f"  task={task_name}  checkpoint={checkpoint_stem}  run={run_name}")
     env.close()
 
