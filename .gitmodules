@@ -1,0 +1,4 @@
+[submodule "source/whole_body_tracking/whole_body_tracking/assets/unitree_description"]
+	path = source/whole_body_tracking/whole_body_tracking/assets/unitree_description
+	url = https://github.com/zzqsgfw/unitree_description.git
+	branch = main
