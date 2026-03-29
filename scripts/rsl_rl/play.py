@@ -60,6 +60,27 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+from whole_body_tracking.utils.rsl_checkpoint_legacy import load_on_policy_runner_checkpoint
+
+_WHOLE_BODY_TRACKING_ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def _resolve_motion_file_path(motion_file: str) -> str:
+    """Resolve motion .npz path (cwd errors or redundant ``whole_body_tracking/`` prefix)."""
+    raw = motion_file.strip()
+    expanded = os.path.expanduser(raw)
+    for candidate in (expanded, os.path.abspath(expanded)):
+        if os.path.isfile(candidate):
+            return candidate
+    rel = raw.replace("\\", "/").lstrip("/")
+    for prefix in ("whole_body_tracking/", "./whole_body_tracking/"):
+        if rel.startswith(prefix):
+            rel = rel[len(prefix) :]
+            break
+    cand = _WHOLE_BODY_TRACKING_ROOT / rel
+    if cand.is_file():
+        return str(cand.resolve())
+    return raw
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -96,8 +117,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = f"./logs/rsl_rl/temp/{file}"
 
         if args_cli.motion_file is not None:
-            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-            env_cfg.commands.motion.motion_file = args_cli.motion_file
+            resolved_mf = _resolve_motion_file_path(args_cli.motion_file)
+            print(f"[INFO]: Using motion file from CLI: {resolved_mf}")
+            env_cfg.commands.motion.motion_file = resolved_mf
 
         art = next((a for a in wandb_run.used_artifacts() if a.type == "motions"), None)
         if art is None:
@@ -107,12 +129,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     else:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        if args_cli.checkpoint is not None:
+            cand = os.path.abspath(os.path.expanduser(args_cli.checkpoint))
+            if os.path.isfile(cand):
+                resume_path = cand
+            else:
+                resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
     if args_cli.motion_file is not None:
-        print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
-        env_cfg.commands.motion.motion_file = args_cli.motion_file
+        resolved_mf = _resolve_motion_file_path(args_cli.motion_file)
+        print(f"[INFO]: Using motion file from CLI: {resolved_mf}")
+        env_cfg.commands.motion.motion_file = resolved_mf
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -140,7 +170,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    load_on_policy_runner_checkpoint(ppo_runner, resume_path, agent_cfg.device)
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
@@ -155,8 +185,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         filename="policy.onnx",
     )
     attach_onnx_metadata(env.unwrapped, args_cli.wandb_path if args_cli.wandb_path else "none", export_model_dir)
-    # reset environment
-    obs, _ = env.get_observations()
+    # reset environment (RslRlVecEnvWrapper.get_observations returns TensorDict only)
+    obs = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
