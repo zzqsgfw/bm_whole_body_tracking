@@ -12,8 +12,12 @@ Trajectory list layout (deterministic):
 
 Schema per trajectory dict (g1_fullbody_v3_dart):
     command              (T, 15)
-    base_pos_w           (T, 3)    # world-frame root position (for MuJoCo viewer)
+    base_pos_w           (T, 3)    # env-frame root position (env origin subtracted)
     base_quat_w          (T, 4)    # world-frame root quaternion [w,x,y,z]
+    robot_anchor_pos_w   (T, 3)    # env-frame robot anchor position
+    robot_anchor_quat_w  (T, 4)    # robot anchor quaternion [w,x,y,z]
+    motion_anchor_pos_w  (T, 3)    # env-frame motion anchor position
+    motion_anchor_quat_w (T, 4)    # motion anchor quaternion [w,x,y,z]
     motion_anchor_pos_b  (T, 3)    # motion anchor relative to robot anchor (body frame)
     motion_anchor_ori_b  (T, 6)    # motion anchor relative orientation (Rot6D)
     body_pos_b           (T, 42)   # 14 bodies * 3 (Cartesian pos in anchor frame)
@@ -82,6 +86,10 @@ FRAME_KEYS = [
     "command",
     "base_pos_w",
     "base_quat_w",
+    "robot_anchor_pos_w",
+    "robot_anchor_quat_w",
+    "motion_anchor_pos_w",
+    "motion_anchor_quat_w",
     "motion_anchor_pos_b",
     "motion_anchor_ori_b",
     "body_pos_b",
@@ -165,42 +173,52 @@ def _inject_noise(
     return policy_action + noise
 
 
-def _probe_frame_dims(raw_env) -> dict[str, int]:
-    """Probe observation dims once."""
+def _probe_frame_shapes(raw_env, motion_cmd) -> dict[str, tuple[int, ...]]:
+    """Probe tensor shapes once."""
     with torch.inference_mode():
         return {
-            "command": isaac_mdp.generated_commands(raw_env, "motion").shape[-1],
-            "base_pos_w": isaac_mdp.root_pos_w(raw_env).shape[-1],
-            "base_quat_w": isaac_mdp.root_quat_w(raw_env).shape[-1],
-            "motion_anchor_pos_b": tracking_mdp.motion_anchor_pos_b(raw_env, "motion").shape[-1],
-            "motion_anchor_ori_b": tracking_mdp.motion_anchor_ori_b(raw_env, "motion").shape[-1],
-            "body_pos_b": tracking_mdp.robot_body_pos_b(raw_env, "motion").shape[-1],
-            "body_ori_b": tracking_mdp.robot_body_ori_b(raw_env, "motion").shape[-1],
-            "base_lin_vel": isaac_mdp.base_lin_vel(raw_env).shape[-1],
-            "base_ang_vel": isaac_mdp.base_ang_vel(raw_env).shape[-1],
-            "joint_pos": isaac_mdp.joint_pos_rel(raw_env).shape[-1],
-            "joint_vel": isaac_mdp.joint_vel_rel(raw_env).shape[-1],
-            "last_action": isaac_mdp.last_action(raw_env).shape[-1],
+            "command": tuple(isaac_mdp.generated_commands(raw_env, "motion").shape[1:]),
+            "base_pos_w": tuple(isaac_mdp.root_pos_w(raw_env).shape[1:]),
+            "base_quat_w": tuple(isaac_mdp.root_quat_w(raw_env).shape[1:]),
+            "robot_anchor_pos_w": tuple(motion_cmd.robot_anchor_pos_w.shape[1:]),
+            "robot_anchor_quat_w": tuple(motion_cmd.robot_anchor_quat_w.shape[1:]),
+            "motion_anchor_pos_w": tuple(motion_cmd.anchor_pos_w.shape[1:]),
+            "motion_anchor_quat_w": tuple(motion_cmd.anchor_quat_w.shape[1:]),
+            "motion_anchor_pos_b": tuple(tracking_mdp.motion_anchor_pos_b(raw_env, "motion").shape[1:]),
+            "motion_anchor_ori_b": tuple(tracking_mdp.motion_anchor_ori_b(raw_env, "motion").shape[1:]),
+            "body_pos_b": tuple(tracking_mdp.robot_body_pos_b(raw_env, "motion").shape[1:]),
+            "body_ori_b": tuple(tracking_mdp.robot_body_ori_b(raw_env, "motion").shape[1:]),
+            "base_lin_vel": tuple(isaac_mdp.base_lin_vel(raw_env).shape[1:]),
+            "base_ang_vel": tuple(isaac_mdp.base_ang_vel(raw_env).shape[1:]),
+            "joint_pos": tuple(isaac_mdp.joint_pos_rel(raw_env).shape[1:]),
+            "joint_vel": tuple(isaac_mdp.joint_vel_rel(raw_env).shape[1:]),
+            "last_action": tuple(isaac_mdp.last_action(raw_env).shape[1:]),
         }
 
 
-def _alloc_chunk(chunk_size: int, num_envs: int, frame_dims: dict[str, int], action_dim: int,
+def _alloc_chunk(chunk_size: int, num_envs: int, frame_shapes: dict[str, tuple[int, ...]], action_dim: int,
                  device: torch.device) -> dict[str, torch.Tensor]:
-    """Allocate a GPU chunk buffer (chunk_size, num_envs, dim)."""
+    """Allocate a GPU chunk buffer (chunk_size, num_envs, *shape)."""
     buf = {}
-    for key, dim in frame_dims.items():
-        buf[key] = torch.empty(chunk_size, num_envs, dim, device=device)
+    for key, shape in frame_shapes.items():
+        buf[key] = torch.empty((chunk_size, num_envs, *shape), device=device)
     buf["policy_action"] = torch.empty(chunk_size, num_envs, action_dim, device=device)
     buf["expert_action"] = torch.empty(chunk_size, num_envs, action_dim, device=device)
     return buf
 
 
-def _write_frame(buf: dict[str, torch.Tensor], idx: int, raw_env,
+def _write_frame(buf: dict[str, torch.Tensor], idx: int, raw_env, motion_cmd,
                  policy_action: torch.Tensor, expert_action: torch.Tensor):
     """Write one step into GPU chunk at position idx."""
+    root_pos_env = isaac_mdp.root_pos_w(raw_env)
+    env_origins = raw_env.scene.env_origins
     buf["command"][idx] = isaac_mdp.generated_commands(raw_env, "motion")
-    buf["base_pos_w"][idx] = isaac_mdp.root_pos_w(raw_env)
+    buf["base_pos_w"][idx] = root_pos_env
     buf["base_quat_w"][idx] = isaac_mdp.root_quat_w(raw_env)
+    buf["robot_anchor_pos_w"][idx] = motion_cmd.robot_anchor_pos_w - env_origins
+    buf["robot_anchor_quat_w"][idx] = motion_cmd.robot_anchor_quat_w
+    buf["motion_anchor_pos_w"][idx] = motion_cmd.anchor_pos_w - env_origins
+    buf["motion_anchor_quat_w"][idx] = motion_cmd.anchor_quat_w
     buf["motion_anchor_pos_b"][idx] = tracking_mdp.motion_anchor_pos_b(raw_env, "motion")
     buf["motion_anchor_ori_b"][idx] = tracking_mdp.motion_anchor_ori_b(raw_env, "motion")
     buf["body_pos_b"][idx] = tracking_mdp.robot_body_pos_b(raw_env, "motion")
@@ -234,6 +252,14 @@ def _vram_is_dangerous(device: torch.device, threshold: float = 0.85) -> bool:
     """True if VRAM usage exceeds threshold (default 85%)."""
     ratio, _, _ = _vram_usage_ratio(device)
     return ratio > threshold
+
+
+def _default_joint_pos_list(raw_env) -> list[float]:
+    """Export Isaac default joint pose robustly as a 29-d list."""
+    joint_pos = raw_env.scene["robot"].data.default_joint_pos_nominal
+    if joint_pos.ndim > 1:
+        joint_pos = joint_pos[0]
+    return joint_pos.detach().cpu().reshape(-1).tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +332,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "task": task_name,
             "output_path": str(output_path),
             "motion_file": env_cfg.commands.motion.motion_file,
+            "anchor_body_name": motion_cmd.cfg.anchor_body_name,
+            "tracked_body_names": list(motion_cmd.cfg.body_names),
             "mode": "full_trajectory (terminations disabled)",
         },
         nesting=4,
@@ -318,19 +346,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     action_dim = 29
     num_envs = args_cli.num_envs
     CHUNK_STEPS = 512
-    frame_dims = _probe_frame_dims(raw_env)
+    frame_shapes = _probe_frame_shapes(raw_env, motion_cmd)
     device = env.unwrapped.device
 
     ratio_init, used_init, total_init = _vram_usage_ratio(device)
     print(f"[INFO] VRAM baseline: {used_init} MB / {total_init} MB ({ratio_init:.1%})")
 
-    gpu_chunk = _alloc_chunk(CHUNK_STEPS, num_envs, frame_dims, action_dim, device)
+    gpu_chunk = _alloc_chunk(CHUNK_STEPS, num_envs, frame_shapes, action_dim, device)
     cpu_store: dict[str, list[torch.Tensor]] = {k: [] for k in FRAME_KEYS}
 
     chunk_mem_mb = sum(t.nelement() * t.element_size() for t in gpu_chunk.values()) / (1024 * 1024)
     print(f"[INFO] GPU chunk: {chunk_mem_mb:.1f} MB ({CHUNK_STEPS} steps x {num_envs} envs)")
     print(f"[INFO] Terminations DISABLED, episode_length=1e6, push_robot OFF")
     print(f"[INFO] Rollout: {num_envs} envs x {max_steps} steps")
+    print(f"[DEBUG] anchor_body_name: {motion_cmd.cfg.anchor_body_name}")
+    print(f"[DEBUG] tracked_body_names: {list(motion_cmd.cfg.body_names)}")
+    print(f"[DEBUG] env0 origin: {raw_env.scene.env_origins[0].detach().cpu().tolist()}")
     if num_envs > 1:
         print(
             f"[INFO] Noise levels by env id: env0={env_noise_levels[0].item():.6f}, "
@@ -345,7 +376,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             policy_action = policy(obs)
             expert_action = _inject_noise(policy_action, noise_mask)
-            _write_frame(gpu_chunk, chunk_idx, raw_env, policy_action, expert_action)
+            _write_frame(gpu_chunk, chunk_idx, raw_env, motion_cmd, policy_action, expert_action)
             obs, _, _, _ = env.step(expert_action)
 
         steps += 1
@@ -382,12 +413,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "recording_name": output_path.stem,
             "trajectory_id": f"{output_path.stem}_traj{env_id:04d}_env{env_id}",
             "schema": "g1_fullbody_v3_dart",
+            "position_frame": "env",
             "condition_dim": 286,
             "action_dim": action_dim,
             "env_id": env_id,
             "noise_std": env_noise,
-            "is_clean": env_noise == 0.0,
+            "joint_names": list(raw_env.scene["robot"].data.joint_names),
+            "default_joint_pos": _default_joint_pos_list(raw_env),
             "task": task_name,
+            "anchor_body_name": motion_cmd.cfg.anchor_body_name,
+            "tracked_body_names": list(motion_cmd.cfg.body_names),
             "source_checkpoint": resume_path,
             "source_run_dir": run_name,
             "motion_file": env_cfg.commands.motion.motion_file,
@@ -400,7 +435,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     total_frames = steps * num_envs
     file_size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"[INFO] Saved {len(trajectories)} trajectories ({total_frames} total frames, {file_size_mb:.1f} MB)")
-    print(f"  trajectories[0] is_clean=True, {steps} frames")
+    print(f"  trajectories[0] noise_std={env_noise_levels[0].item():.6f}, {steps} frames")
     print(f"  task={task_name}  checkpoint={checkpoint_stem}  run={run_name}")
     env.close()
 
